@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# nvidia-triage: Autonomous NVIDIA Linux Driver & Hardware State Diagnostic Tool
+# ==============================================================================
+set -euo pipefail
+
+BOLD="\033[1m"
+GREEN="\033[0;32m"
+RED="\033[0;31m"
+YELLOW="\033[0;33m"
+CYAN="\033[0;36m"
+RESET="\033[0m"
+
+echo -e "${BOLD}${CYAN}=== NVIDIA Linux Diagnostic Scanner ===${RESET}\n"
+
+# 1. PCI Hardware Probe
+echo -e "${BOLD}[1/6] Probing PCIe Bus for NVIDIA Hardware...${RESET}"
+NVIDIA_PCI=$(lspci -D | grep -i 'VGA compatible controller.*NVIDIA' | awk '{print $1}' || true)
+if [[ -z "${NVIDIA_PCI}" ]]; then
+    NVIDIA_PCI=$(lspci -D | grep -i '3D controller.*NVIDIA' | awk '{print $1}' || true)
+fi
+
+if [[ -n "${NVIDIA_PCI}" ]]; then
+    echo -e "  ${GREEN}✓${RESET} Detected NVIDIA GPU at PCIe Address: ${BOLD}${NVIDIA_PCI}${RESET}"
+    GPU_NAME=$(lspci -s "${NVIDIA_PCI}" | cut -d ':' -f3)
+    echo -e "    Model: ${GPU_NAME}"
+    if [[ -f "/sys/bus/pci/devices/${NVIDIA_PCI}/power_state" ]]; then
+        PWR_STATE=$(cat "/sys/bus/pci/devices/${NVIDIA_PCI}/power_state")
+        echo -e "    PCI Power State: ${PWR_STATE}"
+    fi
+else
+    echo -e "  ${RED}✗ No NVIDIA PCIe graphics device found.${RESET}"
+fi
+
+# 2. Kernel Module Status
+echo -e "\n${BOLD}[2/6] Inspecting Kernel Modules...${RESET}"
+MODULES=$(lsmod | grep -E '^nvidia\b|^nvidia_uvm\b|^nvidia_modeset\b|^nvidia_drm\b' || true)
+if [[ -n "${MODULES}" ]]; then
+    echo -e "  ${GREEN}✓${RESET} NVIDIA kernel modules loaded:"
+    echo "${MODULES}" | awk '{printf "    - %-18s (size: %8s, used by: %s)\n", $1, $2, $4}'
+    if [[ -f /proc/driver/nvidia/version ]]; then
+        echo -e "    Driver Version: $(head -n 1 /proc/driver/nvidia/version)"
+    fi
+else
+    echo -e "  ${RED}✗ No NVIDIA kernel modules loaded.${RESET}"
+fi
+
+# 3. Device Nodes in /dev
+echo -e "\n${BOLD}[3/6] Checking /dev Nodes (Container / Sandbox Fence)...${RESET}"
+DEV_NODES=$(ls -d /dev/nvidia* 2>/dev/null || true)
+if [[ -n "${DEV_NODES}" ]]; then
+    echo -e "  ${GREEN}✓${RESET} Device nodes present:"
+    for node in ${DEV_NODES}; do
+        echo -e "    - ${node}"
+    done
+else
+    echo -e "  ${RED}✗ No /dev/nvidia* device nodes found!${RESET}"
+    echo -e "    ${YELLOW}→ Notice: If running inside a container or bwrap sandbox, device isolation is active.${RESET}"
+fi
+
+# 4. Checking File Locks / Active Processes
+echo -e "\n${BOLD}[4/6] Inspecting Process Locks on NVIDIA Devices...${RESET}"
+if command -v lsof >/dev/null 2>&1; then
+    ACTIVE_LOCKS=$(lsof /dev/nvidia* 2>/dev/null | awk 'NR>1 {print $1, $2, $9}' | sort -u || true)
+elif command -v fuser >/dev/null 2>&1; then
+    ACTIVE_LOCKS=$(fuser -v /dev/nvidia* 2>&1 | awk 'NR>1' || true)
+else
+    ACTIVE_LOCKS=""
+fi
+
+if [[ -n "${ACTIVE_LOCKS}" ]]; then
+    echo -e "  ${YELLOW}! Device handles currently open by:${RESET}"
+    echo "${ACTIVE_LOCKS}" | while read -r line; do
+        echo -e "    ${line}"
+    done
+else
+    echo -e "  ${GREEN}✓${RESET} No active process locks on /dev/nvidia*."
+fi
+
+# 5. Kernel Xid Log Analysis
+echo -e "\n${BOLD}[5/6] Inspecting Kernel Journal for NVRM / Xid Errors...${RESET}"
+if command -v journalctl >/dev/null 2>&1; then
+    XID_LOGS=$(journalctl -k -b 2>/dev/null | grep -E "NVRM: Xid" | tail -n 5 || true)
+    if [[ -n "${XID_LOGS}" ]]; then
+        echo -e "  ${RED}✗ Recent Xid Errors detected:${RESET}"
+        echo "${XID_LOGS}" | while read -r log_line; do
+            echo -e "    ${log_line}"
+        done
+        if echo "${XID_LOGS}" | grep -q "Xid.*: 119"; then
+            echo -e "    ${RED}→ CRITICAL: Xid 119 (GSP Firmware RPC Timeout detected).${RESET}"
+        fi
+        if echo "${XID_LOGS}" | grep -q "Xid.*: 154"; then
+            echo -e "    ${RED}→ CRITICAL: Xid 154 (GPU Reset Required - hardware lock).${RESET}"
+        fi
+    else
+        echo -e "  ${GREEN}✓${RESET} No recent Xid errors in current boot journal."
+    fi
+else
+    echo -e "  ${YELLOW}! journalctl not available or access restricted.${RESET}"
+fi
+
+# 6. nvidia-smi Execution
+echo -e "\n${BOLD}[6/6] Executing nvidia-smi Telemetry Probe...${RESET}"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if SMI_OUTPUT=$(nvidia-smi 2>&1); then
+        echo -e "  ${GREEN}✓${RESET} nvidia-smi query succeeded:"
+        echo "${SMI_OUTPUT}"
+    else
+        echo -e "  ${RED}✗ nvidia-smi exited with non-zero status.${RESET}"
+        echo "${SMI_OUTPUT}"
+        if echo "${SMI_OUTPUT}" | grep -q "ERR!"; then
+            echo -e "  ${RED}→ Diagnosis: Telemetry ERR! confirms GSP firmware lock (Xid 154).${RESET}"
+        fi
+    fi
+else
+    echo -e "  ${RED}✗ nvidia-smi command not found in PATH.${RESET}"
+fi
+
+echo -e "\n${BOLD}${CYAN}=== Diagnostic Complete ===${RESET}"

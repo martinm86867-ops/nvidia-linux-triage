@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# nvidia-recover: Automated PCIe Device Rescan & Driver Recovery Helper
+# ==============================================================================
+set -euo pipefail
+
+BOLD="\033[1m"
+GREEN="\033[0;32m"
+RED="\033[0;31m"
+YELLOW="\033[0;33m"
+CYAN="\033[0;36m"
+RESET="\033[0m"
+
+echo -e "${BOLD}${CYAN}=== NVIDIA Linux Driver & PCIe Link Recovery ===${RESET}\n"
+
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Error: This recovery script must be executed as root (sudo).${RESET}"
+   exit 1
+fi
+
+# Detect NVIDIA PCIe ID
+NVIDIA_PCI=$(lspci -D | grep -iE 'VGA compatible controller.*NVIDIA|3D controller.*NVIDIA' | awk '{print $1}' | head -n 1 || true)
+if [[ -z "${NVIDIA_PCI}" ]]; then
+    echo -e "${RED}Error: No NVIDIA PCI device located on the bus.${RESET}"
+    exit 1
+fi
+
+echo -e "Target GPU PCIe Bus ID: ${BOLD}${NVIDIA_PCI}${RESET}"
+
+# Step 1: Stop Daemons
+echo -e "\n${BOLD}[1/4] Stopping NVIDIA power and persistence daemons...${RESET}"
+systemctl stop nvidia-powerd nvidia-persistenced 2>/dev/null || true
+echo -e "  ${GREEN}✓${RESET} Daemons stopped."
+
+# Step 2: Unload kernel modules if possible
+echo -e "\n${BOLD}[2/4] Attempting to unbind kernel modules...${RESET}"
+if modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null; then
+    echo -e "  ${GREEN}✓${RESET} NVIDIA modules cleanly unloaded."
+else
+    echo -e "  ${YELLOW}! Modules are currently held by active desktop processes.${RESET}"
+    echo -e "  ${YELLOW}! Proceeding with direct PCIe link unbind/remove...${RESET}"
+fi
+
+# Step 3: Trigger PCIe Remove and Rescan
+echo -e "\n${BOLD}[3/4] Triggering PCIe remove and rescan...${RESET}"
+if [[ -f "/sys/bus/pci/devices/${NVIDIA_PCI}/remove" ]]; then
+    echo 1 > "/sys/bus/pci/devices/${NVIDIA_PCI}/remove"
+    echo -e "  ${GREEN}✓${RESET} Device ${NVIDIA_PCI} removed from PCI bus."
+    sleep 2
+    echo 1 > /sys/bus/pci/rescan
+    echo -e "  ${GREEN}✓${RESET} PCIe bus rescan triggered."
+    sleep 2
+else
+    echo -e "  ${RED}✗ Cannot access /sys/bus/pci/devices/${NVIDIA_PCI}/remove${RESET}"
+fi
+
+# Step 4: Reload driver stack
+echo -e "\n${BOLD}[4/4] Reloading NVIDIA kernel driver stack...${RESET}"
+modprobe nvidia || true
+modprobe nvidia_uvm || true
+modprobe nvidia_modeset || true
+modprobe nvidia_drm || true
+
+echo -e "\n${BOLD}[Verification] Running nvidia-smi...${RESET}"
+if nvidia-smi; then
+    echo -e "\n${GREEN}${BOLD}Recovery Successful! GPU is fully operational.${RESET}"
+else
+    echo -e "\n${RED}${BOLD}Notice: Silicon did not clear Xid lock. ACPI/EC firmware on laptop requires full reboot:${RESET}"
+    echo -e "  sudo reboot"
+fi
